@@ -6,6 +6,14 @@ the single-sample shortcut and the subclustering loop.
 All stages stream. Nothing requires the full expression matrix in memory.
 
 ---
+## to-do
+- [ ] test on 100M cells
+- [ ] implement parameter recording in adata
+- [ ] (optional) implement azimuthal Gabor filter embedding
+- [ ] user manual website
+- [ ] R version?
+---
+
 
 ## Stage 1 — merge 10x directories into one raw-counts zarr
 
@@ -305,3 +313,4 @@ for convergence failures.
 Chunk sizing is panel-dependent: nnz-per-cell differs by an order of magnitude
 between a targeted panel and a whole-transcriptome one, so a chunk size tuned
 for one will blow up on the other.
+
