@@ -9,7 +9,7 @@ All stages stream. Nothing requires the full expression matrix in memory.
 ## to-do
 - [ ] test on 100M cells
 - [ ] implement parameter recording in adata
-- [ ] directly save embedding to h5ad
+- [ ] directly save embedding to anndata
 - [ ] fix explained variance for solver propack
 - [ ] (optional) implement azimuthal Gabor filter embedding
 - [ ] user manual website
