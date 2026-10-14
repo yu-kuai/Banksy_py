@@ -180,6 +180,13 @@ def _per_sample_stats(X_csr_self, X_csr_nbr, W, sample_slices, chunk_size):
 # Dask helpers (used by dask_cpu and dask_gpu)
 # ---------------------------------------------------------------------------
 
+# Process-global cache for X_sample in zarr-stream mode.
+# Holds at most one sample at a time — evicted when a new (s_start, s_end) key
+# is seen. Safe only with the synchronous dask scheduler (same process, serial
+# task execution), which is always set before calling sc.pp.pca here.
+_zarr_sample_cache: dict = {}
+
+
 def _load_csr_from_zarr(zarr_path, row_start, row_end, n_genes):
     """Load CSR rows [row_start:row_end] from a zarr X store (data/indices/indptr)."""
     import zarr as _zarr
@@ -307,6 +314,69 @@ def _build_banksy_dask_asym_persample_zarr(input_zarr, n_genes, W, lambda_val,
     return banksy_dask
 
 
+def _banksy_chunk_asym_zarr_v2(cell_start, cell_end, s_start, s_end,
+                                input_zarr, n_genes, W,
+                                X_mean, X_std, nbr_mean, nbr_std,
+                                scale_own, scale_nbr):
+    """Like _banksy_chunk_asym_zarr but caches X_sample across sub-chunk calls.
+
+    Within one sample, X_sample (full sample rows) is identical for every
+    sub-chunk task.  With the synchronous dask scheduler tasks run serially
+    in the same process, so the module-level _zarr_sample_cache is shared.
+    The cache holds exactly one entry; when a new (s_start, s_end) key is
+    seen the old entry is evicted immediately, so peak memory = one X_sample.
+    """
+    global _zarr_sample_cache
+    cache_key = (input_zarr, s_start, s_end)
+
+    if cache_key not in _zarr_sample_cache:
+        _zarr_sample_cache.clear()   # evict previous sample
+        _zarr_sample_cache[cache_key] = _load_csr_from_zarr(
+            input_zarr, s_start, s_end, n_genes)
+
+    X_self   = _load_csr_from_zarr(input_zarr, cell_start, cell_end, n_genes)
+    X_sample = _zarr_sample_cache[cache_key]
+
+    X_chunk   = X_self.toarray().astype(np.float64)
+    W_block   = W[cell_start:cell_end, s_start:s_end]
+    nbr_chunk = W_block @ X_sample
+    if sparse.issparse(nbr_chunk):
+        nbr_chunk = nbr_chunk.toarray()
+    nbr_chunk = nbr_chunk.astype(np.float64)
+    X_z   = (X_chunk   - X_mean)   / (X_std   + 1e-10) * scale_own
+    nbr_z = (nbr_chunk - nbr_mean) / (nbr_std + 1e-10) * scale_nbr
+    return np.concatenate([X_z, nbr_z], axis=1)
+
+
+def _build_banksy_dask_asym_persample_zarr_v2(input_zarr, n_genes, W, lambda_val,
+                                               mu_self, std_self, mu_nbr, std_nbr,
+                                               sample_slices, chunk_size=50_000):
+    """Like _build_banksy_dask_asym_persample_zarr but uses _banksy_chunk_asym_zarr_v2
+    so X_sample is loaded from zarr once per sample instead of once per sub-chunk.
+    Requires synchronous dask scheduler.
+    """
+    import dask
+    import dask.array as da
+    n_cols    = n_genes * 2
+    scale_own = float(np.sqrt(1.0 - lambda_val))
+    scale_nbr = float(np.sqrt(lambda_val))
+    delayed_chunks = []
+    for s, (s_start, s_end) in enumerate(sample_slices):
+        for i in range(s_start, s_end, chunk_size):
+            j = min(i + chunk_size, s_end)
+            chunk_d = dask.delayed(_banksy_chunk_asym_zarr_v2)(
+                i, j, s_start, s_end,
+                input_zarr, n_genes, W,
+                mu_self[s], std_self[s], mu_nbr[s], std_nbr[s],
+                scale_own, scale_nbr,
+            )
+            arr = da.from_delayed(chunk_d, shape=(j - i, n_cols), dtype=np.float64)
+            delayed_chunks.append(arr)
+    banksy_dask = da.concatenate(delayed_chunks, axis=0)
+    assert banksy_dask.chunksize[1] == banksy_dask.shape[1]
+    return banksy_dask
+
+
 def _per_sample_stats_from_zarr(input_zarr, n_genes, W, sample_slices, chunk_size):
     """Compute per-sample mean/std by loading one sample at a time from zarr.
     Peak memory = one sample's X (~3 GB for the largest sample) rather than all of X.
@@ -369,8 +439,9 @@ def _pca_linop_cpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
                          X_mean, X_std, nbr_mean, nbr_std, n_comps,
                          zscore, sample_slices,
                          mu_self, std_self, mu_nbr, std_nbr,
-                         fp_dtype=np.float64):
-    from scipy.sparse.linalg import LinearOperator, svds
+                         fp_dtype=np.float64,
+                         linop_svd_solver='propack'):
+    from scipy.sparse.linalg import LinearOperator, svds, eigsh
     n_cells   = X_csr_self.shape[0]
     n_self    = X_csr_self.shape[1]
     n_nbr     = X_csr_nbr.shape[1]
@@ -387,7 +458,7 @@ def _pca_linop_cpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
         nbr_mean_f = nbr_mean.astype(fp_dtype)
 
         def matvec(v):
-            v    = np.asarray(v, dtype=fp_dtype)
+            v    = np.asarray(v, dtype=fp_dtype).ravel()
             vsum = v.sum()
             top    = (X_csr_self.T @ v    - X_mean_f   * vsum) / sx * scale_own
             Wt_v   = Wt @ v
@@ -395,7 +466,7 @@ def _pca_linop_cpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
             return np.concatenate([top, bottom])
 
         def rmatvec(u):
-            u  = np.asarray(u, dtype=fp_dtype)
+            u  = np.asarray(u, dtype=fp_dtype).ravel()
             u1 = u[:n_self] * scale_own
             u2 = u[n_self:] * scale_nbr
             top    = X_csr_self @ (u1 / sx) - fp_dtype(mu_over_sx @ u1)
@@ -418,7 +489,7 @@ def _pca_linop_cpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
         mu_nbr_f  = [mu_nbr[s].astype(fp_dtype)              for s in range(len(sample_slices))]
 
         def matvec(v):
-            v        = np.asarray(v, dtype=fp_dtype)
+            v        = np.asarray(v, dtype=fp_dtype).ravel()
             Wt_v     = Wt @ v
             res_self = np.zeros(n_self, dtype=fp_dtype)
             res_nbr  = np.zeros(n_nbr,  dtype=fp_dtype)
@@ -432,7 +503,7 @@ def _pca_linop_cpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
             return np.concatenate([res_self * scale_own, res_nbr * scale_nbr])
 
         def rmatvec(u):
-            u   = np.asarray(u, dtype=fp_dtype)
+            u   = np.asarray(u, dtype=fp_dtype).ravel()
             u1  = u[:n_self] * scale_own
             u2  = u[n_self:] * scale_nbr
             res = np.zeros(n_cells, dtype=fp_dtype)
@@ -445,12 +516,62 @@ def _pca_linop_cpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
                                    - np.dot(mu_nbr_f[s], u2s))
             return res
 
-    M_op = LinearOperator(shape=(n_self + n_nbr, n_cells),
-                          matvec=matvec, rmatvec=rmatvec, dtype=fp_dtype)
-    print(f"  LinearOperator shape: {M_op.shape}  k={n_comps}  solver=propack",
+    if linop_svd_solver == 'bbt_arpack':
+        # Work in n_feat-dimensional space via eigsh on B @ B.T (n_feat × n_feat).
+        # Working vectors are n_feat-dimensional → O(ncv × n_feat) memory, constant in n_cells.
+        # Each operator application: rmatvec(v) → 1 n_cells-sized intermediate (400 MB at 100M),
+        # then matvec(w) → n_feat-sized result. The intermediate is never accumulated.
+        n_feat = n_self + n_nbr
+
+        def bbt_matvec(v):
+            w = rmatvec(np.asarray(v, dtype=fp_dtype))  # (n_cells,) — one vector only
+            return matvec(w)                             # (n_feat,)
+
+        A_op = LinearOperator(shape=(n_feat, n_feat), matvec=bbt_matvec, dtype=fp_dtype)
+        print(f"  B@B.T operator shape: {A_op.shape}  k={n_comps}  solver=bbt_arpack",
+              flush=True)
+        _monitor = MemMonitor(interval=0.5).start()
+        eigenvalues, U_feat = eigsh(A_op, k=n_comps, which='LM')
+        _monitor.stop()
+
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvalues, U_feat = eigenvalues[idx], U_feat[:, idx]
+        S = np.sqrt(np.maximum(eigenvalues, 0.0))
+
+        # Recovery: embeddings = B.T @ U_feat  (= right singular vectors × singular values)
+        # One rmatvec call per PC — each is a single (n_cells,) vector.
+        print(f"  Recovery: embeddings = B.T @ U ({n_comps} rmatvec calls) ...", flush=True)
+        embeddings = np.column_stack([rmatvec(U_feat[:, i]) for i in range(n_comps)])
+
+        ev        = eigenvalues / n_cells
+        total_var = n_self * (1.0 - lambda_val) + n_nbr * lambda_val
+        evr       = ev / total_var
+        return embeddings, ev, evr
+
+    n_feat = n_self + n_nbr
+
+    def matmat_op(X):
+        X   = np.asarray(X, dtype=fp_dtype)
+        out = np.empty((n_feat, X.shape[1]), dtype=fp_dtype)
+        for i in range(X.shape[1]):
+            out[:, i] = matvec(X[:, i])
+        return out
+
+    def rmatmat_op(X):
+        X   = np.asarray(X, dtype=fp_dtype)
+        out = np.empty((n_cells, X.shape[1]), dtype=fp_dtype)
+        for i in range(X.shape[1]):
+            out[:, i] = rmatvec(X[:, i])
+        return out
+
+    M_op = LinearOperator(shape=(n_feat, n_cells),
+                          matvec=matvec, rmatvec=rmatvec,
+                          matmat=matmat_op, rmatmat=rmatmat_op,
+                          dtype=fp_dtype)
+    print(f"  LinearOperator shape: {M_op.shape}  k={n_comps}  solver={linop_svd_solver}",
           flush=True)
     _monitor = MemMonitor(interval=0.5).start()
-    U, S, Vt = svds(M_op, k=n_comps, solver='propack')
+    U, S, Vt = svds(M_op, k=n_comps, solver=linop_svd_solver)
     _monitor.stop()
 
     idx = np.argsort(S)[::-1]
@@ -615,10 +736,11 @@ def _pca_dask_cpu_asym(adata, X_csr_self, X_csr_nbr, W, lambda_val,
     import scanpy as sc
 
     if input_zarr is not None and zscore == 'per_sample':
-        # zarr-streaming path: X never fully in RAM; each task reads its chunk.
-        # mu_self has shape (n_samples, n_genes) — reliable source of n_genes.
+        # zarr-streaming v2: X_sample cached per sample (1 zarr read per sample
+        # instead of 1 per sub-chunk). Requires synchronous scheduler.
         n_genes = mu_self.shape[1]
-        banksy_dask = _build_banksy_dask_asym_persample_zarr(
+        _zarr_sample_cache.clear()   # clean state before PCA
+        banksy_dask = _build_banksy_dask_asym_persample_zarr_v2(
             input_zarr, n_genes, W, lambda_val,
             mu_self, std_self, mu_nbr, std_nbr, sample_slices,
             chunk_size=chunk_size,
@@ -732,7 +854,8 @@ def run_pca_asymmetric(adata, W,
                        solver='linop_cpu',
                        dtype='float32',
                        zarr_dir=None,
-                       input_zarr=None):
+                       input_zarr=None,
+                       linop_svd_solver='propack'):
     """BANKSY PCA with independent gene filters, optional per-sample Z-scoring,
     and multiple solver backends.
 
@@ -872,6 +995,7 @@ def run_pca_asymmetric(adata, W,
             X_mean, X_std, nbr_mean, nbr_std, n_comps,
             zscore, sample_slices, mu_self, std_self, mu_nbr, std_nbr,
             fp_dtype=_fp,
+            linop_svd_solver=linop_svd_solver,
         )
 
     if solver == 'linop_gpu':
@@ -906,3 +1030,4 @@ def run_pca_asymmetric(adata, W,
             n_comps, chunk_size, genes_self, genes_nbr,
             zscore, sample_slices, mu_self, std_self, mu_nbr, std_nbr,
         )
+
