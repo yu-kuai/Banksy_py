@@ -134,7 +134,7 @@ Only `X/data` is rewritten: row scaling and `log1p` do not change sparsity, so
 sc_dask_pipeline_post_pca_multisolver_zarr_h5ad_v2_subset.py
     --input_dir   <RAW>            parent of stacked.zarr
     --output_dir  <OBJ>
-    --solver      linop_cpu | linop_gpu | linop_gpu_propack | dask_cpu | dask_gpu
+    --solver      linop_cpu | linop_gpu | dask_cpu | dask_gpu
     --lambda_val  <lambda>
     --zscore      per_sample | global
     --harmony_cols sample  --harmony_theta 2.0
