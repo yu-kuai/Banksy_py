@@ -47,7 +47,9 @@ import psutil
 _proc = psutil.Process(os.getpid())
 _t0   = time.time()
 
-SOLVERS = ('linop_cpu', 'linop_gpu', 'dask_cpu', 'dask_gpu', 'sparse_cov_cpu', 'sparse_cov_gpu')
+SOLVERS = ('linop_cpu', 'linop_gpu', 'dask_cpu', 'dask_gpu',
+           'sparse_cov_cpu', 'sparse_cov_gpu',
+           'sparse_cov_cpu_1pass', 'sparse_cov_gpu_1pass')
 
 
 class MemMonitor:
@@ -192,7 +194,7 @@ def _load_csr_from_zarr(zarr_path, row_start, row_end, n_genes, gene_indices=Non
     If gene_indices is provided, subset columns to those indices after loading.
     """
     import zarr as _zarr
-    z       = _zarr.open_group(zarr_path, mode='r', zarr_format=2)
+    z       = _zarr.open_group(zarr_path, mode='r')
     iptr    = z['X/indptr'][row_start:row_end + 1]
     nnz0    = int(iptr[0])
     nnz1    = int(iptr[-1])
@@ -855,6 +857,154 @@ def _build_banksy_cov_sparse_zarr(input_zarr, n_genes, W,
     return C
 
 
+def _build_banksy_cov_1pass(X_csr_self, X_csr_nbr, W, sample_slices,
+                            lambda_val, chunk_size, fp_dtype):
+    """In-memory CPU single-pass: compute per-sample μ/σ and covariance in one loop.
+    Eliminates the separate _per_batch_stats call; only valid for zscore='per_batch'.
+    """
+    n_self       = X_csr_self.shape[1]
+    n_nbr        = X_csr_nbr.shape[1]
+    n_samp       = len(sample_slices)
+    scale_own    = float(np.sqrt(1.0 - lambda_val))
+    scale_nbr    = float(np.sqrt(lambda_val))
+    _nbr_is_self = (X_csr_nbr is X_csr_self)
+
+    C_ss = np.zeros((n_self, n_self), dtype=fp_dtype)
+    C_sh = np.zeros((n_self, n_nbr),  dtype=fp_dtype)
+    C_hh = np.zeros((n_nbr,  n_nbr),  dtype=fp_dtype)
+
+    for s, (start, end) in enumerate(sample_slices):
+        n_s  = end - start
+        X_s  = _csr_row_view(X_csr_self, start, end).astype(fp_dtype, copy=False)
+        Xn_s = (X_s if _nbr_is_self
+                else _csr_row_view(X_csr_nbr, start, end).astype(fp_dtype, copy=False))
+        W_s  = W[start:end, start:end].astype(fp_dtype, copy=False)
+        print(f"  [sparse_cov_1pass {s+1}/{n_samp}] cells {start}:{end}", flush=True)
+
+        # Per-sample μ_x, σ_x — sparse O(nnz), no densification
+        mu_x_s, std_x_s = _sparse_mean_std(X_s)
+        mu_x_s  = mu_x_s.astype(fp_dtype)
+        std_x_s = std_x_s.astype(fp_dtype)
+        std_x_s[std_x_s == 0] = 1.0
+        sx_s = (std_x_s + 1e-10).astype(fp_dtype)
+
+        # XᵀX - n*μμᵀ (sparse gram, no densification of X)
+        C_ss_s  = (X_s.T @ X_s).toarray()
+        C_ss_s -= n_s * np.outer(mu_x_s, mu_x_s)
+        C_ss   += (C_ss_s / sx_s[:, None]) / sx_s[None, :]
+        del C_ss_s
+
+        # Single chunk loop: accumulate H stats + raw covariance blocks
+        sum_h    = np.zeros(n_nbr, dtype=np.float64)
+        sum_sq_h = np.zeros(n_nbr, dtype=np.float64)
+        C_hh_raw = np.zeros((n_nbr, n_nbr), dtype=fp_dtype)
+        C_sh_raw = np.zeros((n_self, n_nbr), dtype=fp_dtype)
+        for i in range(0, n_s, chunk_size):
+            j       = min(i + chunk_size, n_s)
+            h_chunk = (W_s[i:j, :] @ Xn_s).toarray().astype(fp_dtype)
+            x_chunk = X_s[i:j].toarray().astype(fp_dtype)
+            sum_h    += h_chunk.sum(axis=0).astype(np.float64)
+            sum_sq_h += (h_chunk.astype(np.float64) ** 2).sum(axis=0)
+            C_hh_raw += h_chunk.T @ h_chunk
+            C_sh_raw += x_chunk.T @ h_chunk
+
+        mu_n_s  = (sum_h / n_s).astype(fp_dtype)
+        sq_mn_h = (sum_sq_h / n_s).astype(fp_dtype)
+        std_n_s = np.sqrt(np.maximum(sq_mn_h - mu_n_s ** 2, 0.0)).astype(fp_dtype)
+        std_n_s[std_n_s == 0] = 1.0
+        sn_s = (std_n_s + 1e-10).astype(fp_dtype)
+
+        C_hh_s = C_hh_raw - n_s * np.outer(mu_n_s, mu_n_s)
+        C_sh_s = C_sh_raw - n_s * np.outer(mu_x_s, mu_n_s)
+        C_hh  += (C_hh_s / sn_s[:, None]) / sn_s[None, :]
+        C_sh  += (C_sh_s / sx_s[:, None]) / sn_s[None, :]
+        del C_hh_raw, C_sh_raw, C_hh_s, C_sh_s
+
+    C_ss *= scale_own ** 2
+    C_hh *= scale_nbr ** 2
+    C_sh *= scale_own * scale_nbr
+
+    n_feat = n_self + n_nbr
+    C = np.empty((n_feat, n_feat), dtype=fp_dtype)
+    C[:n_self, :n_self] = C_ss
+    C[:n_self, n_self:] = C_sh
+    C[n_self:, :n_self] = C_sh.T
+    C[n_self:, n_self:] = C_hh
+    return C
+
+
+def _build_banksy_cov_zarr_1pass(input_zarr, n_genes, W, sample_slices,
+                                   lambda_val, chunk_size, fp_dtype,
+                                   gene_indices=None):
+    """Zarr CPU single-pass: compute per-sample μ/σ and covariance in one zarr read per sample.
+    Eliminates the separate _per_batch_stats_from_zarr pass.
+    """
+    n_samp    = len(sample_slices)
+    n_self    = len(gene_indices) if gene_indices is not None else n_genes
+    n_nbr     = n_self
+    scale_own = float(np.sqrt(1.0 - lambda_val))
+    scale_nbr = float(np.sqrt(lambda_val))
+
+    C_ss = np.zeros((n_self, n_self), dtype=fp_dtype)
+    C_sh = np.zeros((n_self, n_nbr),  dtype=fp_dtype)
+    C_hh = np.zeros((n_nbr,  n_nbr),  dtype=fp_dtype)
+
+    for s, (start, end) in enumerate(sample_slices):
+        n_s = end - start
+        X_s = _load_csr_from_zarr(input_zarr, start, end, n_genes,
+                                   gene_indices).astype(fp_dtype, copy=False)
+        W_s = W[start:end, start:end].astype(fp_dtype, copy=False)
+        print(f"  [sparse_cov_zarr_1pass {s+1}/{n_samp}] cells {start}:{end}", flush=True)
+
+        mu_x_s, std_x_s = _sparse_mean_std(X_s)
+        mu_x_s  = mu_x_s.astype(fp_dtype)
+        std_x_s = std_x_s.astype(fp_dtype)
+        std_x_s[std_x_s == 0] = 1.0
+        sx_s = (std_x_s + 1e-10).astype(fp_dtype)
+
+        C_ss_s  = (X_s.T @ X_s).toarray()
+        C_ss_s -= n_s * np.outer(mu_x_s, mu_x_s)
+        C_ss   += (C_ss_s / sx_s[:, None]) / sx_s[None, :]
+        del C_ss_s
+
+        sum_h    = np.zeros(n_nbr, dtype=np.float64)
+        sum_sq_h = np.zeros(n_nbr, dtype=np.float64)
+        C_hh_raw = np.zeros((n_nbr, n_nbr), dtype=fp_dtype)
+        C_sh_raw = np.zeros((n_self, n_nbr), dtype=fp_dtype)
+        for i in range(0, n_s, chunk_size):
+            j       = min(i + chunk_size, n_s)
+            h_chunk = (W_s[i:j, :] @ X_s).toarray().astype(fp_dtype)
+            x_chunk = X_s[i:j].toarray().astype(fp_dtype)
+            sum_h    += h_chunk.sum(axis=0).astype(np.float64)
+            sum_sq_h += (h_chunk.astype(np.float64) ** 2).sum(axis=0)
+            C_hh_raw += h_chunk.T @ h_chunk
+            C_sh_raw += x_chunk.T @ h_chunk
+
+        mu_n_s  = (sum_h / n_s).astype(fp_dtype)
+        sq_mn_h = (sum_sq_h / n_s).astype(fp_dtype)
+        std_n_s = np.sqrt(np.maximum(sq_mn_h - mu_n_s ** 2, 0.0)).astype(fp_dtype)
+        std_n_s[std_n_s == 0] = 1.0
+        sn_s = (std_n_s + 1e-10).astype(fp_dtype)
+
+        C_hh_s = C_hh_raw - n_s * np.outer(mu_n_s, mu_n_s)
+        C_sh_s = C_sh_raw - n_s * np.outer(mu_x_s, mu_n_s)
+        C_hh  += (C_hh_s / sn_s[:, None]) / sn_s[None, :]
+        C_sh  += (C_sh_s / sx_s[:, None]) / sn_s[None, :]
+        del C_hh_raw, C_sh_raw, C_hh_s, C_sh_s, X_s, W_s
+
+    C_ss *= scale_own ** 2
+    C_hh *= scale_nbr ** 2
+    C_sh *= scale_own * scale_nbr
+
+    n_feat = n_self + n_nbr
+    C = np.empty((n_feat, n_feat), dtype=fp_dtype)
+    C[:n_self, :n_self] = C_ss
+    C[:n_self, n_self:] = C_sh
+    C[n_self:, :n_self] = C_sh.T
+    C[n_self:, n_self:] = C_hh
+    return C
+
+
 def _pca_sparse_cov_cpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
                               X_mean, X_std, nbr_mean, nbr_std, n_comps,
                               zscore, sample_slices,
@@ -989,6 +1139,146 @@ def _pca_sparse_cov_cpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
                     res[start:end] += (W_blocks[s] @ (X_nbr_blocks[s] @ u2s)
                                        - np.dot(mu_nf[s], u2s))
                 return res
+
+        print(f"  Recovery: {n_comps} rmatvec calls ...", flush=True)
+        embeddings = np.column_stack([rmatvec(U_feat[:, i]) for i in range(n_comps)])
+
+    ev        = eigenvalues / n_cells
+    total_var = n_self * (1.0 - lambda_val) + n_nbr * lambda_val
+    evr       = ev / total_var
+    return embeddings, ev, evr
+
+
+# ---------------------------------------------------------------------------
+# Solver: sparse_cov_cpu_1pass
+# ---------------------------------------------------------------------------
+
+def _pca_sparse_cov_cpu_1pass_asym(X_csr_self, X_csr_nbr, W, lambda_val,
+                                    n_comps, sample_slices,
+                                    chunk_size=50_000, fp_dtype=np.float64,
+                                    input_zarr=None, n_genes=None, gene_indices=None):
+    """BANKSY PCA via single-pass sparse covariance + eigh (CPU).
+
+    Fuses per-sample stats computation and covariance accumulation into one loop
+    per sample, eliminating the separate zarr/memory stats pass.
+    Only supports zscore='per_batch'. Recovery step identical to sparse_cov_cpu.
+    """
+    from scipy.linalg import eigh
+    _zarr_mode = input_zarr is not None
+    if _zarr_mode:
+        n_self  = len(gene_indices) if gene_indices is not None else n_genes
+        n_nbr   = n_self
+        n_cells = sample_slices[-1][1]
+    else:
+        n_cells = X_csr_self.shape[0]
+        n_self  = X_csr_self.shape[1]
+        n_nbr   = X_csr_nbr.shape[1]
+    n_feat    = n_self + n_nbr
+    scale_own = float(np.sqrt(1.0 - lambda_val))
+    scale_nbr = float(np.sqrt(lambda_val))
+
+    print(f"\n  Building BANKSY covariance ({n_feat}×{n_feat}) 1-pass ...", flush=True)
+    _mon_cov = MemMonitor(interval=0.5).start()
+    if _zarr_mode:
+        C = _build_banksy_cov_zarr_1pass(
+            input_zarr, n_genes, W, sample_slices,
+            lambda_val, chunk_size, fp_dtype, gene_indices=gene_indices,
+        )
+    else:
+        C = _build_banksy_cov_1pass(
+            X_csr_self, X_csr_nbr, W, sample_slices,
+            lambda_val, chunk_size, fp_dtype,
+        )
+    _mon_cov.stop()
+    print(f"  Cov built.  peak_rss={_mon_cov.peak_rss:.2f} GB", flush=True)
+
+    print(f"  eigh (LAPACK) k={n_comps} on ({n_feat}×{n_feat}) ...", flush=True)
+    _mon_eig = MemMonitor(interval=0.5).start()
+    eigenvalues, U_feat = eigh(C, subset_by_index=[n_feat - n_comps, n_feat - 1],
+                               driver='evr', overwrite_a=True)
+    _mon_eig.stop()
+    del C
+
+    idx = np.argsort(eigenvalues)[::-1]
+    eigenvalues, U_feat = eigenvalues[idx], U_feat[:, idx]
+
+    # Recovery: re-read per sample (zarr) or use rmatvec (in-memory).
+    # We store the per-sample stats encountered during 1-pass in the cov build —
+    # but those aren't returned. Re-derive them here for the projection.
+    # Cost: one extra zarr pass (same as the two-pass solver's recovery pass).
+    if _zarr_mode:
+        U1 = (U_feat[:n_self, :] * scale_own).astype(fp_dtype)
+        U2 = (U_feat[n_self:, :] * scale_nbr).astype(fp_dtype)
+        embeddings = np.zeros((n_cells, n_comps), dtype=fp_dtype)
+        print(f"  Recovery (zarr 1-pass, vectorised): {len(sample_slices)} samples ...",
+              flush=True)
+        for s, (start, end) in enumerate(sample_slices):
+            X_s = _load_csr_from_zarr(input_zarr, start, end, n_genes,
+                                      gene_indices).astype(fp_dtype, copy=False)
+            W_s = W[start:end, start:end].astype(fp_dtype, copy=False)
+            mu_x_s, std_x_s = _sparse_mean_std(X_s)
+            mu_x_s  = mu_x_s.astype(fp_dtype)
+            std_x_s = std_x_s.astype(fp_dtype); std_x_s[std_x_s == 0] = 1.0
+            sx      = (std_x_s + 1e-10).astype(fp_dtype)
+            # H stats for nbr
+            sum_h    = np.zeros(n_nbr, dtype=np.float64)
+            sum_sq_h = np.zeros(n_nbr, dtype=np.float64)
+            n_s = end - start
+            for i in range(0, n_s, chunk_size):
+                j       = min(i + chunk_size, n_s)
+                h_chunk = (W_s[i:j, :] @ X_s).toarray().astype(np.float64)
+                sum_h    += h_chunk.sum(axis=0)
+                sum_sq_h += (h_chunk ** 2).sum(axis=0)
+            mu_n_s  = (sum_h / n_s).astype(fp_dtype)
+            std_n_s = np.sqrt(np.maximum((sum_sq_h / n_s).astype(fp_dtype)
+                                         - mu_n_s ** 2, 0.0))
+            std_n_s[std_n_s == 0] = 1.0
+            sn      = (std_n_s + 1e-10).astype(fp_dtype)
+            U1s     = U1 / sx[:, None]
+            U2s     = U2 / sn[:, None]
+            mu_x_U1s = mu_x_s.astype(fp_dtype) @ U1s
+            mu_n_U2s = mu_n_s.astype(fp_dtype) @ U2s
+            embeddings[start:end, :] = (
+                X_s @ U1s - mu_x_U1s
+                + W_s @ (X_s @ U2s) - mu_n_U2s
+            )
+            del X_s, W_s
+    else:
+        _nbr_is_self = (X_csr_nbr is X_csr_self)
+        X_self_blocks = [_csr_row_view(X_csr_self, s, e).astype(fp_dtype, copy=False)
+                         for s, e in sample_slices]
+        X_nbr_blocks  = (X_self_blocks if _nbr_is_self
+                         else [_csr_row_view(X_csr_nbr, s, e).astype(fp_dtype, copy=False)
+                               for s, e in sample_slices])
+        W_blocks  = [W[s:e, s:e].astype(fp_dtype, copy=False) for s, e in sample_slices]
+
+        def rmatvec(u):
+            u   = np.asarray(u, dtype=fp_dtype).ravel()
+            u1  = u[:n_self] * scale_own
+            u2  = u[n_self:] * scale_nbr
+            res = np.zeros(n_cells, dtype=fp_dtype)
+            for s, (start, end) in enumerate(sample_slices):
+                mu_x_s, std_x_s = _sparse_mean_std(X_self_blocks[s])
+                std_x_s[std_x_s == 0] = 1.0
+                sx = (std_x_s + 1e-10).astype(fp_dtype)
+                n_s = end - start
+                sum_h = np.zeros(n_nbr, dtype=np.float64)
+                sum_sq_h = np.zeros(n_nbr, dtype=np.float64)
+                for i in range(0, n_s, chunk_size):
+                    j = min(i + chunk_size, n_s)
+                    h_c = (W_blocks[s][i:j, :] @ X_nbr_blocks[s]).toarray().astype(np.float64)
+                    sum_h    += h_c.sum(axis=0)
+                    sum_sq_h += (h_c ** 2).sum(axis=0)
+                mu_n_s = (sum_h / n_s).astype(fp_dtype)
+                std_n_s = np.sqrt(np.maximum((sum_sq_h / n_s).astype(fp_dtype)
+                                              - mu_n_s ** 2, 0.0))
+                std_n_s[std_n_s == 0] = 1.0
+                sn  = (std_n_s + 1e-10).astype(fp_dtype)
+                u1s = u1 / sx; u2s = u2 / sn
+                res[start:end] += X_self_blocks[s] @ u1s - np.dot(mu_x_s.astype(fp_dtype), u1s)
+                res[start:end] += (W_blocks[s] @ (X_nbr_blocks[s] @ u2s)
+                                   - np.dot(mu_n_s, u2s))
+            return res
 
         print(f"  Recovery: {n_comps} rmatvec calls ...", flush=True)
         embeddings = np.column_stack([rmatvec(U_feat[:, i]) for i in range(n_comps)])
@@ -1285,6 +1575,206 @@ def _pca_sparse_cov_gpu_asym(X_csr_self, X_csr_nbr, W, lambda_val,
             U1s = U1s_g
             U2s = U2s_g
 
+        embeddings_gpu[start:end, :] = (
+            X_s_gpu @ U1s - mu_x_U1s
+            + W_s_gpu @ (X_s_gpu @ U2s) - mu_n_U2s
+        )
+        del X_s_gpu, W_s_gpu
+
+    del W_gpu
+    embeddings = cp.asnumpy(embeddings_gpu)
+    del embeddings_gpu
+
+    ev        = eigenvalues / n_cells
+    total_var = n_self * (1.0 - lambda_val) + n_nbr * lambda_val
+    evr       = ev / total_var
+    return embeddings, ev, evr
+
+
+# ---------------------------------------------------------------------------
+# Solver: sparse_cov_gpu_1pass
+# ---------------------------------------------------------------------------
+
+def _build_banksy_cov_zarr_gpu_1pass(input_zarr, n_genes, W_gpu, sample_slices,
+                                      lambda_val, chunk_size, gene_indices=None):
+    """GPU single-pass: compute per-sample μ/σ and covariance in one zarr read per sample.
+    X loaded from zarr once per sample; μ_x/σ_x from sparse GPU ops (O(nnz));
+    μ_h/σ_h accumulated in the same chunk loop as C_hh_raw and C_sh_raw.
+    """
+    import cupy as cp
+    import cupyx.scipy.sparse as csp
+    from rapids_singlecell._cuda import _spca_cuda as _spca
+
+    n_samp    = len(sample_slices)
+    n_self    = len(gene_indices) if gene_indices is not None else n_genes
+    n_nbr     = n_self
+    scale_own = float(np.sqrt(1.0 - lambda_val))
+    scale_nbr = float(np.sqrt(lambda_val))
+
+    C_ss = cp.zeros((n_self, n_self), dtype=cp.float32)
+    C_sh = cp.zeros((n_self, n_nbr),  dtype=cp.float32)
+    C_hh = cp.zeros((n_nbr,  n_nbr),  dtype=cp.float32)
+
+    for s, (start, end) in enumerate(sample_slices):
+        n_s     = end - start
+        X_s_cpu = _load_csr_from_zarr(input_zarr, start, end, n_genes,
+                                       gene_indices).astype(np.float32)
+        X_s_gpu = csp.csr_matrix(X_s_cpu); del X_s_cpu
+        X_s_gpu.sort_indices()
+        W_s_gpu = W_gpu[start:end, start:end]
+        print(f"  [sparse_cov_gpu_1pass {s+1}/{n_samp}] cells {start}:{end}", flush=True)
+
+        # Per-sample μ_x, σ_x on GPU — O(nnz) sparse ops, no densification
+        mu_x_s = cp.asarray(X_s_gpu.mean(axis=0)).ravel()
+        X2_data = X_s_gpu.data ** 2
+        X2_gpu  = csp.csr_matrix((X2_data, X_s_gpu.indices, X_s_gpu.indptr),
+                                  shape=X_s_gpu.shape)
+        sq_mn_x = cp.asarray(X2_gpu.mean(axis=0)).ravel(); del X2_gpu, X2_data
+        std_x_s = cp.sqrt(cp.maximum(sq_mn_x - mu_x_s ** 2, 0.0)); del sq_mn_x
+        # zero-std genes → scale by 1.0 (constant gene → z-score ≈ 0)
+        sx_s = cp.where(std_x_s == 0, cp.ones_like(std_x_s), std_x_s) + cp.float32(1e-10)
+
+        # XᵀX (sparse CUDA kernel) − n*μμᵀ
+        C_ss_s = cp.zeros((n_self, n_self), dtype=cp.float32)
+        _spca.gram_csr_upper(
+            X_s_gpu.indptr, X_s_gpu.indices, X_s_gpu.data,
+            nrows=n_s, ncols=n_self, out=C_ss_s,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+        _spca.copy_upper_to_lower(out=C_ss_s, ncols=n_self,
+                                   stream=cp.cuda.get_current_stream().ptr)
+        C_ss_s -= n_s * cp.outer(mu_x_s, mu_x_s)
+        C_ss   += (C_ss_s / sx_s[:, None]) / sx_s[None, :]
+        del C_ss_s
+
+        # Single chunk loop: accumulate H stats + raw covariance blocks
+        sum_h    = cp.zeros(n_nbr, dtype=cp.float64)
+        sum_sq_h = cp.zeros(n_nbr, dtype=cp.float64)
+        C_hh_raw = cp.zeros((n_nbr, n_nbr), dtype=cp.float32)
+        C_sh_raw = cp.zeros((n_self, n_nbr), dtype=cp.float32)
+        for i in range(0, n_s, chunk_size):
+            j       = min(i + chunk_size, n_s)
+            h_chunk = (W_s_gpu[i:j, :] @ X_s_gpu).toarray()   # float32 GPU dense
+            x_chunk = X_s_gpu[i:j].toarray()                   # float32 GPU dense
+            sum_h    += h_chunk.sum(axis=0).astype(cp.float64)
+            sum_sq_h += (h_chunk.astype(cp.float64) ** 2).sum(axis=0)
+            C_hh_raw += h_chunk.T @ h_chunk
+            C_sh_raw += x_chunk.T @ h_chunk
+
+        mu_n_s  = (sum_h / n_s).astype(cp.float32)
+        sq_mn_h = (sum_sq_h / n_s).astype(cp.float32)
+        std_n_s = cp.sqrt(cp.maximum(sq_mn_h - mu_n_s ** 2, 0.0))
+        sn_s = cp.where(std_n_s == 0, cp.ones_like(std_n_s), std_n_s) + cp.float32(1e-10)
+        del std_n_s, sq_mn_h
+
+        C_hh_s = C_hh_raw - n_s * cp.outer(mu_n_s, mu_n_s)
+        C_sh_s = C_sh_raw - n_s * cp.outer(mu_x_s, mu_n_s)
+        C_hh  += (C_hh_s / sn_s[:, None]) / sn_s[None, :]
+        C_sh  += (C_sh_s / sx_s[:, None]) / sn_s[None, :]
+        del C_hh_raw, C_sh_raw, C_hh_s, C_sh_s, X_s_gpu, W_s_gpu
+        cp.cuda.Stream.null.synchronize()
+
+    C_ss *= scale_own ** 2
+    C_hh *= scale_nbr ** 2
+    C_sh *= scale_own * scale_nbr
+
+    n_feat = n_self + n_nbr
+    C = cp.empty((n_feat, n_feat), dtype=cp.float32)
+    C[:n_self, :n_self] = C_ss
+    C[:n_self, n_self:] = C_sh
+    C[n_self:, :n_self] = C_sh.T
+    C[n_self:, n_self:] = C_hh
+    return C
+
+
+def _pca_sparse_cov_gpu_1pass_asym(X_csr_self, X_csr_nbr, W, lambda_val,
+                                    n_comps, sample_slices,
+                                    chunk_size=20_000,
+                                    input_zarr=None, n_genes=None, gene_indices=None):
+    """BANKSY PCA via single-pass GPU covariance + cuSOLVER eigh.
+    Requires input_zarr (zarr-streaming mode only). Fuses stats + covariance into
+    one zarr read per sample. Recovery step identical to sparse_cov_gpu.
+    """
+    import cupy as cp
+    import cupyx.scipy.sparse as csp
+    import rmm
+    from rmm.allocators.cupy import rmm_cupy_allocator
+
+    if input_zarr is None:
+        raise ValueError("sparse_cov_gpu_1pass requires input_zarr")
+
+    rmm.reinitialize(managed_memory=False, pool_allocator=False, devices=0)
+    cp.cuda.set_allocator(rmm_cupy_allocator)
+
+    n_self  = len(gene_indices) if gene_indices is not None else n_genes
+    n_nbr   = n_self
+    n_cells = sample_slices[-1][1]
+    n_feat  = n_self + n_nbr
+    scale_own = float(np.sqrt(1.0 - lambda_val))
+    scale_nbr = float(np.sqrt(lambda_val))
+
+    print(f"  Transferring W ({W.shape}) to GPU ...", flush=True)
+    W_gpu = csp.csr_matrix(W.astype(np.float32))
+
+    print(f"\n  Building BANKSY covariance ({n_feat}×{n_feat}) GPU 1-pass ...", flush=True)
+    _mon_cov = MemMonitor(interval=0.5).start()
+    C_gpu = _build_banksy_cov_zarr_gpu_1pass(
+        input_zarr, n_genes, W_gpu, sample_slices,
+        lambda_val, chunk_size, gene_indices=gene_indices,
+    )
+    _mon_cov.stop()
+    print(f"  Cov built.  peak_rss={_mon_cov.peak_rss:.2f} GB", flush=True)
+
+    print(f"  eigh (cuSOLVER) on ({n_feat}×{n_feat}) ...", flush=True)
+    _mon_eig = MemMonitor(interval=0.5).start()
+    eigenvalues_gpu, U_feat_gpu = cp.linalg.eigh(C_gpu)
+    _mon_eig.stop()
+    del C_gpu
+
+    eigenvalues = cp.asnumpy(eigenvalues_gpu[::-1][:n_comps])
+    U_feat_gpu  = cp.flip(U_feat_gpu, axis=1)[:, :n_comps].astype(cp.float32)
+    U1_gpu = U_feat_gpu[:n_self, :] * scale_own
+    U2_gpu = U_feat_gpu[n_self:, :] * scale_nbr
+
+    # Recovery: re-read zarr per sample, re-derive per-sample stats, project onto PCs.
+    print(f"  Recovery (GPU 1-pass, vectorised): {len(sample_slices)} samples ...", flush=True)
+    embeddings_gpu = cp.zeros((n_cells, n_comps), dtype=cp.float32)
+
+    for s, (start, end) in enumerate(sample_slices):
+        X_s_cpu = _load_csr_from_zarr(input_zarr, start, end, n_genes,
+                                       gene_indices).astype(np.float32)
+        X_s_gpu = csp.csr_matrix(X_s_cpu); del X_s_cpu
+        X_s_gpu.sort_indices()
+        W_s_gpu = W_gpu[start:end, start:end]
+
+        # Re-derive per-sample stats for projection
+        mu_x_s = cp.asarray(X_s_gpu.mean(axis=0)).ravel()
+        X2_data = X_s_gpu.data ** 2
+        X2_gpu  = csp.csr_matrix((X2_data, X_s_gpu.indices, X_s_gpu.indptr),
+                                  shape=X_s_gpu.shape)
+        sq_mn_x = cp.asarray(X2_gpu.mean(axis=0)).ravel(); del X2_gpu, X2_data
+        std_x_s = cp.sqrt(cp.maximum(sq_mn_x - mu_x_s ** 2, 0.0))
+        sx      = cp.where(std_x_s == 0, cp.ones_like(std_x_s), std_x_s) + cp.float32(1e-10)
+        del sq_mn_x, std_x_s
+
+        n_s = end - start
+        sum_h    = cp.zeros(n_nbr, dtype=cp.float64)
+        sum_sq_h = cp.zeros(n_nbr, dtype=cp.float64)
+        for i in range(0, n_s, chunk_size):
+            j       = min(i + chunk_size, n_s)
+            h_chunk = (W_s_gpu[i:j, :] @ X_s_gpu).toarray().astype(cp.float64)
+            sum_h    += h_chunk.sum(axis=0)
+            sum_sq_h += (h_chunk ** 2).sum(axis=0)
+        mu_n_s  = (sum_h / n_s).astype(cp.float32)
+        sq_mn_h = (sum_sq_h / n_s).astype(cp.float32)
+        std_n_s = cp.sqrt(cp.maximum(sq_mn_h - mu_n_s ** 2, 0.0))
+        sn      = cp.where(std_n_s == 0, cp.ones_like(std_n_s), std_n_s) + cp.float32(1e-10)
+        del std_n_s, sq_mn_h, sum_h, sum_sq_h
+
+        U1s      = U1_gpu / sx[:, None]
+        U2s      = U2_gpu / sn[:, None]
+        mu_x_U1s = mu_x_s @ U1s
+        mu_n_U2s = mu_n_s @ U2s
         embeddings_gpu[start:end, :] = (
             X_s_gpu @ U1s - mu_x_U1s
             + W_s_gpu @ (X_s_gpu @ U2s) - mu_n_U2s
@@ -1638,14 +2128,19 @@ def run_banksy_pca(adata, W,
     if zscore not in ('global', 'per_batch'):
         raise ValueError(f"zscore must be 'global' or 'per_batch', got '{zscore}'")
 
+    # 1-pass solvers absorb stats computation — no separate stats pass needed.
+    _1pass_solvers = ('sparse_cov_cpu_1pass', 'sparse_cov_gpu_1pass',
+                      'sparse_cov_cpu', 'sparse_cov_gpu')
+
     # When input_zarr is set for dask_{cpu,gpu}, X is never loaded into RAM.
     # Covers both per_batch (persample_zarr_v2) and global (global_zarr) paths.
     _use_zarr_x = (input_zarr is not None
-                   and solver in ('dask_cpu', 'dask_gpu', 'sparse_cov_cpu', 'sparse_cov_gpu'))
+                   and solver in ('dask_cpu', 'dask_gpu', 'sparse_cov_cpu', 'sparse_cov_gpu',
+                                  'sparse_cov_cpu_1pass', 'sparse_cov_gpu_1pass'))
 
     if _use_zarr_x:
         import zarr as _zarr_mod
-        _z_meta = _zarr_mod.open_group(input_zarr, mode='r', zarr_format=2)
+        _z_meta = _zarr_mod.open_group(input_zarr, mode='r')
         n_genes_zarr = int(_z_meta['X/indptr'].shape[0] - 1
                            if 'X/indptr' in _z_meta
                            else _z_meta['var/_index'].shape[0])
@@ -1718,16 +2213,20 @@ def run_banksy_pca(adata, W,
             )
         sample_slices = _get_sample_slices(adata, batch_key)
         n_samples     = len(sample_slices)
-        print(f"Computing per-sample stats ({n_samples} samples) ...", flush=True)
-        if _use_zarr_x:
-            mu_self, std_self, mu_nbr, std_nbr = _per_batch_stats_from_zarr(
-                input_zarr, n_genes_zarr, W, sample_slices, chunk_size,
-                gene_indices=gene_indices,
-            )
+        if solver in _1pass_solvers:
+            print(f"1-pass solver: skipping separate stats pass ({n_samples} samples) ...",
+                  flush=True)
         else:
-            mu_self, std_self, mu_nbr, std_nbr = _per_batch_stats(
-                X_csr_self, X_csr_nbr, W, sample_slices, chunk_size
-            )
+            print(f"Computing per-sample stats ({n_samples} samples) ...", flush=True)
+            if _use_zarr_x:
+                mu_self, std_self, mu_nbr, std_nbr = _per_batch_stats_from_zarr(
+                    input_zarr, n_genes_zarr, W, sample_slices, chunk_size,
+                    gene_indices=gene_indices,
+                )
+            else:
+                mu_self, std_self, mu_nbr, std_nbr = _per_batch_stats(
+                    X_csr_self, X_csr_nbr, W, sample_slices, chunk_size
+                )
 
     # ------------------------------------------------------------------
     # Dispatch to solver
@@ -1769,10 +2268,11 @@ def run_banksy_pca(adata, W,
         )
 
     if solver == 'sparse_cov_cpu':
-        return _pca_sparse_cov_cpu_asym(
+        if zscore != 'per_batch':
+            raise ValueError("sparse_cov_cpu only supports zscore='per_batch'")
+        return _pca_sparse_cov_cpu_1pass_asym(
             X_csr_self, X_csr_nbr, W, lambda_val,
-            X_mean, X_std, nbr_mean, nbr_std, n_comps,
-            zscore, sample_slices, mu_self, std_self, mu_nbr, std_nbr,
+            n_comps, sample_slices,
             chunk_size=chunk_size, fp_dtype=_fp,
             input_zarr=input_zarr if _use_zarr_x else None,
             n_genes=n_genes_zarr if _use_zarr_x else None,
@@ -1780,10 +2280,35 @@ def run_banksy_pca(adata, W,
         )
 
     if solver == 'sparse_cov_gpu':
-        return _pca_sparse_cov_gpu_asym(
+        if zscore != 'per_batch':
+            raise ValueError("sparse_cov_gpu only supports zscore='per_batch'")
+        return _pca_sparse_cov_gpu_1pass_asym(
             X_csr_self, X_csr_nbr, W, lambda_val,
-            X_mean, X_std, nbr_mean, nbr_std, n_comps,
-            zscore, sample_slices, mu_self, std_self, mu_nbr, std_nbr,
+            n_comps, sample_slices,
+            chunk_size=chunk_size,
+            input_zarr=input_zarr if _use_zarr_x else None,
+            n_genes=n_genes_zarr if _use_zarr_x else None,
+            gene_indices=gene_indices,
+        )
+
+    if solver == 'sparse_cov_cpu_1pass':
+        if zscore != 'per_batch':
+            raise ValueError("sparse_cov_cpu_1pass only supports zscore='per_batch'")
+        return _pca_sparse_cov_cpu_1pass_asym(
+            X_csr_self, X_csr_nbr, W, lambda_val,
+            n_comps, sample_slices,
+            chunk_size=chunk_size, fp_dtype=_fp,
+            input_zarr=input_zarr if _use_zarr_x else None,
+            n_genes=n_genes_zarr if _use_zarr_x else None,
+            gene_indices=gene_indices,
+        )
+
+    if solver == 'sparse_cov_gpu_1pass':
+        if zscore != 'per_batch':
+            raise ValueError("sparse_cov_gpu_1pass only supports zscore='per_batch'")
+        return _pca_sparse_cov_gpu_1pass_asym(
+            X_csr_self, X_csr_nbr, W, lambda_val,
+            n_comps, sample_slices,
             chunk_size=chunk_size,
             input_zarr=input_zarr if _use_zarr_x else None,
             n_genes=n_genes_zarr if _use_zarr_x else None,
